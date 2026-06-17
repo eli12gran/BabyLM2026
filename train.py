@@ -1,4 +1,5 @@
 import os
+import shutil
 import json
 import logging
 from typing import Dict, List, Optional
@@ -40,8 +41,12 @@ TRAINING_CONFIG = {
     },
 
     "output_dir": "./model_nooverlap",
+    "babylm_checkpoint_dir": "./babylm_checkpoints",
 
-    # BabyLM 2026 Strict competition checkpoint intervals (token-based)
+    # BabyLM 2026 Strict competition checkpoint intervals (exposure-based)
+    # These are saved separately from normal Hugging Face recovery checkpoints.
+    # Strict-small requires 1M..10M and then 20M..100M.
+
     "checkpoint_intervals": [
         1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000,
         6_000_000, 7_000_000, 8_000_000, 9_000_000, 10_000_000,
@@ -271,44 +276,182 @@ def preprocess_dataset(dataset: Dataset, tokenizer, max_seq_length: int = 256) -
 
 class TokenCounterCallback(TrainerCallback):
     """
-    Track tokens and save checkpoints at BabyLM competition intervals.
-    Checkpoints are saved in: model_nooverlap/checkpoint-{token_count}M
+    Save BabyLM evaluation checkpoints at exposure intervals while keeping the
+    normal Hugging Face Trainer recovery checkpoints unchanged.
+
+    Normal recovery checkpoints still happen through TrainingArguments:
+        ./model_nooverlap/checkpoint-500
+        ./model_nooverlap/checkpoint-1000
+        ...
+
+    BabyLM evaluation checkpoints are additionally saved here:
+        ./babylm_checkpoints/chck_1M
+        ./babylm_checkpoints/chck_2M
+        ...
+        ./babylm_checkpoints/chck_100M
+
+    The exposure counter is based on fixed-length LM training-token exposure:
+        global_step * per_device_train_batch_size * gradient_accumulation_steps * max_seq_length
+
+    Because this script chunks the corpus into 256-token sequences, this is the
+    practical counter for "how many training tokens the model has consumed".
     """
-    def __init__(self, max_seq_length=256, checkpoint_intervals=None):
+    def __init__(
+        self,
+        max_seq_length=256,
+        checkpoint_intervals=None,
+        output_dir="./babylm_checkpoints",
+        tokenizer_asset_dir=".",
+    ):
         self.max_seq_length = max_seq_length
         self.checkpoint_intervals = checkpoint_intervals or []
+        self.output_dir = output_dir
+        self.tokenizer_asset_dir = tokenizer_asset_dir
+
         self.total_tokens_seen = 0
         self.checkpoints_saved = set()
 
-    def on_step_end(self, args, state, control, **kwargs):
-        # Estimate tokens from batch size and sequence length
-        tokens_this_step = (
-            args.per_device_train_batch_size *
-            self.max_seq_length *
-            args.gradient_accumulation_steps
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def _tokens_per_optimizer_step(self, args):
+        return (
+            args.per_device_train_batch_size
+            * args.gradient_accumulation_steps
+            * self.max_seq_length
         )
-        self.total_tokens_seen += tokens_this_step
 
-        # Check if we need to save at any competition checkpoint interval
+    def _checkpoint_name(self, checkpoint_tokens: int) -> str:
+        return f"chck_{checkpoint_tokens // 1_000_000}M"
+
+    def _copy_tokenizer_assets(self, save_dir: str):
+        """
+        Copy tokenizer assets needed to reload/evaluate the NOOVERLAP model.
+
+        model.save_pretrained() saves the model/config, but your tokenizer is a
+        custom object built from tokenizer_eng/nld/zho.json plus tokenizer_utilities.py.
+        """
+        asset_names = [
+            "tokenizer_eng.json",
+            "tokenizer_nld.json",
+            "tokenizer_zho.json",
+            "tokenizer_utilities.py",
+        ]
+
+        copied = []
+        for name in asset_names:
+            src = os.path.join(self.tokenizer_asset_dir, name)
+            dst = os.path.join(save_dir, name)
+
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                copied.append(name)
+            else:
+                logger.warning(f"Tokenizer asset not found, not copied: {src}")
+
+        return copied
+
+    def _save_babylm_checkpoint(self, model, args, state, checkpoint_tokens: int):
+        checkpoint_name = self._checkpoint_name(checkpoint_tokens)
+        save_dir = os.path.join(self.output_dir, checkpoint_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save model/config in Hugging Face format for the evaluation pipeline.
+        model.save_pretrained(save_dir, safe_serialization=True)
+
+        # Save tokenizer assets for your custom NOOVERLAP tokenizer.
+        copied_assets = self._copy_tokenizer_assets(save_dir)
+
+        # Save training arguments and metadata for reproducibility.
+        args.to_json_file(os.path.join(save_dir, "training_args.json"))
+
+        latest_log = state.log_history[-1] if state.log_history else {}
+        metadata = {
+            "checkpoint_name": checkpoint_name,
+            "checkpoint_tokens": checkpoint_tokens,
+            "checkpoint_millions": checkpoint_tokens / 1_000_000,
+            "actual_tokens_seen_estimate": self.total_tokens_seen,
+            "global_step": state.global_step,
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+            "loss": latest_log.get("loss", None),
+            "learning_rate": latest_log.get("learning_rate", None),
+            "max_seq_length": self.max_seq_length,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "tokens_per_optimizer_step": self._tokens_per_optimizer_step(args),
+            "timestamp": datetime.now().isoformat(),
+            "tokenizer_assets_copied": copied_assets,
+            "checkpoint_type": "babylm_evaluation_checkpoint",
+            "note": (
+                "This checkpoint was saved at a BabyLM exposure threshold. "
+                "It is separate from Hugging Face Trainer recovery checkpoints."
+            ),
+        }
+
+        with open(os.path.join(save_dir, "babylm_checkpoint_metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"{'=' * 70}")
+        logger.info(f"Saved BabyLM evaluation checkpoint: {checkpoint_name}")
+        logger.info(f"Path: {save_dir}")
+        logger.info(f"Requested exposure threshold: {checkpoint_tokens:,} tokens")
+        logger.info(f"Actual estimated exposure: {self.total_tokens_seen:,} tokens")
+        logger.info(f"Global step: {state.global_step}")
+        logger.info(f"Tokenizer assets copied: {copied_assets}")
+        logger.info(f"{'=' * 70}")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        """
+        Initialize from state.global_step. This keeps the counter sane even if
+        you later resume from a Hugging Face Trainer checkpoint.
+        """
+        tokens_per_step = self._tokens_per_optimizer_step(args)
+        self.total_tokens_seen = state.global_step * tokens_per_step
+
+        self.checkpoints_saved = {
+            checkpoint_tokens
+            for checkpoint_tokens in self.checkpoint_intervals
+            if checkpoint_tokens <= self.total_tokens_seen
+        }
+
+        logger.info("=" * 70)
+        logger.info("BABYLM EVALUATION CHECKPOINT CALLBACK INITIALIZED")
+        logger.info(f"BabyLM checkpoint output dir: {self.output_dir}")
+        logger.info(f"Global step: {state.global_step}")
+        logger.info(f"Tokens per optimizer step: {tokens_per_step:,}")
+        logger.info(f"Initial estimated tokens seen: {self.total_tokens_seen:,}")
+        logger.info(f"Already passed BabyLM checkpoint thresholds: {len(self.checkpoints_saved)}")
+        logger.info("=" * 70)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """
+        Called after each optimizer step.
+
+        This saves BabyLM evaluation checkpoints directly, while the normal
+        Trainer checkpoint logic continues independently from save_steps=500.
+        """
+        model = kwargs.get("model", None)
+        if model is None:
+            logger.warning("No model found in callback kwargs; cannot save BabyLM checkpoint.")
+            return control
+
+        tokens_per_step = self._tokens_per_optimizer_step(args)
+        self.total_tokens_seen = state.global_step * tokens_per_step
+
+        # Save every BabyLM threshold crossed by this optimizer step.
         for checkpoint_tokens in self.checkpoint_intervals:
-            if (self.total_tokens_seen >= checkpoint_tokens and
-                checkpoint_tokens not in self.checkpoints_saved):
-
+            if (
+                self.total_tokens_seen >= checkpoint_tokens
+                and checkpoint_tokens not in self.checkpoints_saved
+            ):
                 self.checkpoints_saved.add(checkpoint_tokens)
-                control.should_save = True
-
-                tokens_in_millions = checkpoint_tokens / 1_000_000
-                logger.info(f"\n{'='*70}")
-                logger.info(f"🏆 BABYLM COMPETITION CHECKPOINT: {tokens_in_millions:.0f}M tokens")
-                logger.info(f"   Step: {state.global_step}")
-                logger.info(f"   Epoch: {state.epoch:.2f}")
-                logger.info(f"   Loss: {state.log_history[-1].get('loss', 'N/A')}")
-                logger.info(f"{'='*70}\n")
-
-                break
+                self._save_babylm_checkpoint(
+                    model=model,
+                    args=args,
+                    state=state,
+                    checkpoint_tokens=checkpoint_tokens,
+                )
 
         return control
-
 
 class DetailedCheckpointCallback(TrainerCallback):
     """
@@ -363,7 +506,7 @@ class DetailedCheckpointCallback(TrainerCallback):
             json.dump(self.checkpoint_info, f, indent=2)
         
         logger.info(
-            f"💾 Recovery checkpoint {step}: Loss={checkpoint_data['loss']:.4f} | "
+            f"Recovery checkpoint {step}: Loss={checkpoint_data['loss']:.4f} | "
             f"Epoch={checkpoint_data['epoch']:.1f} | "
             f"Progress={progress_pct:.1f}%"
         )
@@ -451,7 +594,9 @@ def setup_training(model: GPT2LMHeadModel, train_dataset: Dataset) -> tuple:
     # Initialize callbacks
     token_callback = TokenCounterCallback(
         max_seq_length=TRAINING_CONFIG["data"]["max_seq_length"],
-        checkpoint_intervals=TRAINING_CONFIG["checkpoint_intervals"]
+        checkpoint_intervals=TRAINING_CONFIG["checkpoint_intervals"],
+        output_dir=TRAINING_CONFIG["babylm_checkpoint_dir"],
+        tokenizer_asset_dir=".",
     )
     
     detailed_callback = DetailedCheckpointCallback(save_every_n_steps=1000)
@@ -475,6 +620,8 @@ def setup_training(model: GPT2LMHeadModel, train_dataset: Dataset) -> tuple:
     logger.info(f"Sequence length: {TRAINING_CONFIG['data']['max_seq_length']}")
     logger.info(f"BabyLM competition checkpoints: {len(TRAINING_CONFIG['checkpoint_intervals'])}")
     logger.info(f"Recovery checkpoints: Every 1,000 steps")
+    logger.info(f"Normal Trainer checkpoint dir: {TRAINING_CONFIG['output_dir']}")
+    logger.info(f"BabyLM evaluation checkpoint dir: {TRAINING_CONFIG['babylm_checkpoint_dir']}")
     logger.info("="*70)
 
     return trainer, token_callback
@@ -528,7 +675,9 @@ def main():
     logger.info("="*70)
     logger.info(f"Target: 100M tokens (BabyLM 2026 Strict Track)")
     logger.info(f"Competition checkpoints: {len(TRAINING_CONFIG['checkpoint_intervals'])}")
-    logger.info(f"Recovery checkpoints: Every 1,000 steps to {TRAINING_CONFIG['output_dir']}/checkpoints_detailed/")
+    logger.info(f"Recovery checkpoints: Every 1,000 steps to ./checkpoints_detailed/")
+    logger.info(f"Normal Trainer checkpoints: {TRAINING_CONFIG['output_dir']}/checkpoint-*")
+    logger.info(f"BabyLM evaluation checkpoints: {TRAINING_CONFIG['babylm_checkpoint_dir']}/chck_*")
     logger.info("="*70 + "\n")
     
     trainer.train()
@@ -536,7 +685,7 @@ def main():
     logger.info("\n" + "="*70)
     logger.info("TRAINING COMPLETE!")
     logger.info("="*70)
-    logger.info(f"BabyLM checkpoints saved: {len(token_callback.checkpoints_saved)}/{len(TRAINING_CONFIG['checkpoint_intervals'])}")
+    logger.info(f"BabyLM evaluation checkpoints saved: {len(token_callback.checkpoints_saved)}/{len(TRAINING_CONFIG['checkpoint_intervals'])}")
     logger.info(f"Total tokens trained: {token_callback.total_tokens_seen:,}")
     logger.info(f"Final model: {TRAINING_CONFIG['output_dir']}/final")
     logger.info("="*70)
@@ -545,12 +694,20 @@ def main():
     model.save_pretrained(f"{TRAINING_CONFIG['output_dir']}/final")
     logger.info(f"✓ Final model saved to {TRAINING_CONFIG['output_dir']}/final")
 
-    # List all checkpoints
+    # List all normal Hugging Face Trainer recovery checkpoints
     import os
     checkpoint_dir = TRAINING_CONFIG['output_dir']
     if os.path.exists(checkpoint_dir):
-        checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith('checkpoint-')]
-        logger.info(f"\n✓ Saved {len(checkpoints)} model recovery checkpoints")
+        checkpoints = sorted([d for d in os.listdir(checkpoint_dir) if d.startswith('checkpoint-')])
+        logger.info(f"\n✓ Saved {len(checkpoints)} model recovery checkpoints in {checkpoint_dir}")
+        logger.info(f"Recovery checkpoints: {checkpoints}")
+
+    # List all BabyLM evaluation checkpoints
+    babylm_dir = TRAINING_CONFIG["babylm_checkpoint_dir"]
+    if os.path.exists(babylm_dir):
+        babylm_checkpoints = sorted([d for d in os.listdir(babylm_dir) if d.startswith("chck_")])
+        logger.info(f"✓ Saved {len(babylm_checkpoints)} BabyLM evaluation checkpoints in {babylm_dir}")
+        logger.info(f"BabyLM evaluation checkpoints: {babylm_checkpoints}")
 
 
 if __name__ == "__main__":
