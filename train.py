@@ -362,7 +362,8 @@ class TokenCounterCallback(TrainerCallback):
         copied_assets = self._copy_tokenizer_assets(save_dir)
 
         # Save training arguments and metadata for reproducibility.
-        args.to_json_file(os.path.join(save_dir, "training_args.json"))
+        with open(os.path.join(save_dir, "training_args.json"), "w") as f:
+            json.dump(args.to_dict(), f, indent=2)
 
         latest_log = state.log_history[-1] if state.log_history else {}
         metadata = {
