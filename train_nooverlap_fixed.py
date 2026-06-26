@@ -140,18 +140,27 @@ def safe_float(value):
 # TOKENIZER LOADING AND CORRECT NOOVERLAP COMBINATION
 # ============================================================================
 
-def load_monolingual_tokenizers(tokenizer_dir: str = ".") -> Dict[str, Tokenizer]:
+def load_monolingual_tokenizers(tokenizer_dir: str = DEFAULT_TOKENIZER_DIR) -> Dict[str, Tokenizer]:
     logger.info("Loading monolingual Unigram tokenizers")
 
     tokenizers = {}
-    for lang in ["eng", "nld", "zho"]:
-        tokenizer_path = os.path.join(tokenizer_dir, f"tokenizer_{lang}.json")
+
+    for lang in LANGUAGES:
+        tokenizer_path = os.path.join(
+            tokenizer_dir,
+            f"tokenizer_{lang}",
+            f"tokenizer_{lang}.json",
+        )
+
         if not os.path.exists(tokenizer_path):
-            raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
+            raise FileNotFoundError(
+                f"Tokenizer not found for {lang}: {tokenizer_path}"
+            )
 
         tokenizers[lang] = Tokenizer.from_file(tokenizer_path)
         vocab_size = len(tokenizers[lang].get_vocab())
-        logger.info(f"✓ Loaded {lang}: {vocab_size:,} local tokens")
+
+        logger.info(f"✓ Loaded {lang}: {vocab_size:,} local tokens from {tokenizer_path}")
 
     return tokenizers
 
