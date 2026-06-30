@@ -1,25 +1,3 @@
-#!/usr/bin/env python3
-"""
-Train ModernBERT with the correct NOOVERLAP tokenizer process.
-
-This script reuses the already-trained monolingual NOOVERLAP tokenizer assets:
-
-    tokenizers_nooverlap_fixed/
-        metadata.json
-        tokenizer_eng/tokenizer_eng.json
-        tokenizer_nld/tokenizer_nld.json
-        tokenizer_zho/tokenizer_zho.json
-
-It does NOT retrain tokenizers.
-
-Key differences from the GPT-2 NOOVERLAP script:
-  - Model: ModernBertForMaskedLM instead of GPT2LMHeadModel.
-  - Objective: masked language modeling (MLM), not causal language modeling.
-  - Sequences: [CLS] + 254 content tokens + [SEP] when max_seq_length=256.
-  - Labels: produced dynamically by an MLM collator; unmasked positions are -100.
-  - Special tokens are never masked.
-"""
-
 import argparse
 import json
 import logging
