@@ -294,19 +294,8 @@ def count_official_tokens(text: str, lang: str, zho_counter_tokenizer=None) -> i
     raise ValueError(f"Unknown language: {lang}")
 
 
-def load_training_datasets(
-    adjusted_budget_per_lang: int = 33_333_333,
-    max_examples_per_lang: Optional[int] = None,
-) -> Dict[str, Dataset]:
-    """
-    Same data selection logic as the GPT-2 NOOVERLAP script:
-      - same HF datasets
-      - same byte-premium factors
-      - same adjusted budget per language
-      - deterministic first-N selection until the budget threshold is reached
+def load_training_datasets(adjusted_budget_per_lang: int = 33_333_333, max_examples_per_lang: Optional[int] = None) -> Dict[str, Dataset]:
 
-    There is no random sampling here. The seed affects the later shuffle only.
-    """
     logger.info("=" * 70)
     logger.info("LOADING DATASETS WITH BYTE-PREMIUM ADJUSTMENT")
     logger.info("=" * 70)
@@ -381,7 +370,7 @@ def load_training_datasets(
     logger.info(f"Total adjusted budget: {total_adjusted:,.0f}")
     logger.info("=" * 70)
 
-    return datasets
+    return datasets, budget_report
 
 
 # ============================================================================
@@ -474,6 +463,7 @@ def preprocess_language_dataset_for_mlm(
 
 def preprocess_nooverlap_datasets_for_mlm(
     datasets: Dict[str, Dataset],
+    budget_report: dict, 
     nooverlap_tokenizer: NOOVERLAPTokenizer,
     max_seq_length: int = 256,
     tokenize_batch_size: int = 1000,
@@ -507,6 +497,8 @@ def preprocess_nooverlap_datasets_for_mlm(
 
     train_dataset = concatenate_datasets(chunked_by_lang)
     train_dataset = train_dataset.shuffle(seed=seed)
+    adjusted_words_per_epoch = int(sum(v["adjusted_tokens"] for v in budget_report.values()))
+    logger.info(f"Adjusted words per epoch (BabyLM budget unit): {adjusted_words_per_epoch:,}")
 
     logger.info("=" * 70)
     logger.info(f"Combined train dataset: {len(train_dataset):,} sequences")
@@ -514,7 +506,7 @@ def preprocess_nooverlap_datasets_for_mlm(
     logger.info(f"Approx corpus tokens per epoch including CLS/SEP: {len(train_dataset) * max_seq_length:,}")
     logger.info("=" * 70)
 
-    return train_dataset
+    return train_dataset, adjusted_words_per_epoch
 
 
 # ============================================================================
@@ -635,79 +627,89 @@ class NOOVERLAPMLMCollator:
 
 class TokenCounterCallback(TrainerCallback):
     """
-    Save BabyLM-style exposure checkpoints at token-exposure intervals.
+    Save BabyLM-style exposure checkpoints at word-exposure intervals.
 
-    Note:
-      For MLM, these are exposure checkpoints, not causal next-token checkpoints.
-      The exposure counter mirrors your GPT-2 scripts:
-        global_step * batch_size * grad_accum * max_seq_length
+    The competition measures exposure in byte-premium-adjusted whitespace-separated
+    words (official tokens), NOT BPE positions. This callback tracks:
+
+        total_words_seen = global_step * adjusted_words_per_optimizer_step
+
+    where adjusted_words_per_optimizer_step is derived from the actual word counts
+    collected during data selection (passed in at construction time), so it is
+    always consistent with the budget numbers logged by load_training_datasets().
     """
 
     def __init__(
         self,
         nooverlap_tokenizer: NOOVERLAPTokenizer,
+        adjusted_words_per_epoch: int,       # <-- NEW: sum of adjusted official tokens across all langs
+        train_dataset_size: int,             # <-- NEW: number of shuffled sequences in the dataset
         max_seq_length: int = 256,
         checkpoint_intervals=None,
         output_dir: str = "./babylm_checkpoints_nooverlap_modernbert",
         tokenizer_asset_dir: str = ".",
     ):
         self.nooverlap_tokenizer = nooverlap_tokenizer
+        self.adjusted_words_per_epoch = adjusted_words_per_epoch
+        self.train_dataset_size = train_dataset_size
         self.max_seq_length = max_seq_length
         self.checkpoint_intervals = checkpoint_intervals or []
         self.output_dir = output_dir
         self.tokenizer_asset_dir = tokenizer_asset_dir
 
-        self.total_tokens_seen = 0
+        self.total_words_seen = 0
         self.checkpoints_saved = set()
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _tokens_per_optimizer_step(self, args) -> int:
+    def _adjusted_words_per_optimizer_step(self, args) -> float:
+        """
+        How many byte-premium-adjusted words does one optimizer step consume?
+
+        One optimizer step processes (batch_size * grad_accum) sequences.
+        The full dataset has train_dataset_size sequences == adjusted_words_per_epoch words.
+        So: words_per_step = (sequences_per_step / total_sequences) * words_per_epoch
+        """
+        sequences_per_step = (
+            args.per_device_train_batch_size
+            * args.gradient_accumulation_steps
+        )
+        return (sequences_per_step / self.train_dataset_size) * self.adjusted_words_per_epoch
+
+    def _bpe_tokens_per_optimizer_step(self, args) -> int:
+        """BPE positions per step — kept for metadata logging only."""
         return (
             args.per_device_train_batch_size
             * args.gradient_accumulation_steps
             * self.max_seq_length
         )
 
-    def _checkpoint_name(self, checkpoint_tokens: int) -> str:
-        return f"chck_{checkpoint_tokens // 1_000_000}M"
+    def _checkpoint_name(self, checkpoint_words: int) -> str:
+        if checkpoint_words < 1_000_000:
+            return f"chck_{checkpoint_words // 1_000}K"
+        return f"chck_{checkpoint_words // 1_000_000}M"
 
     def _copy_optional_tokenizer_assets(self, save_dir: str):
         copied = []
-
         for lang in LANGUAGES:
             src = get_monolingual_tokenizer_path(self.tokenizer_asset_dir, lang)
             dst_name = f"tokenizer_{lang}.json"
-            dst = os.path.join(save_dir, dst_name)
-
-            shutil.copy2(src, dst)
+            shutil.copy2(src, os.path.join(save_dir, dst_name))
             copied.append(dst_name)
-
-        # Copy root metadata and optional wrappers if available.
-        optional_assets = [
-            "metadata.json",
-            "tokenizer_utilities_nooverlap.py",
-            "tokenization_nooverlap.py",
-        ]
-
-        for name in optional_assets:
+        for name in ["metadata.json", "tokenizer_utilities_nooverlap.py", "tokenization_nooverlap.py"]:
             src = os.path.join(self.tokenizer_asset_dir, name)
-            dst = os.path.join(save_dir, name)
-
             if os.path.exists(src):
-                shutil.copy2(src, dst)
+                shutil.copy2(src, os.path.join(save_dir, name))
                 copied.append(name)
-
         return copied
 
-    def _save_babylm_checkpoint(self, model, args, state, checkpoint_tokens: int) -> None:
-        checkpoint_name = self._checkpoint_name(checkpoint_tokens)
+    def _save_babylm_checkpoint(self, model, args, state, checkpoint_words: int) -> None:
+        checkpoint_name = self._checkpoint_name(checkpoint_words)
         save_dir = os.path.join(self.output_dir, checkpoint_name)
         os.makedirs(save_dir, exist_ok=True)
 
         model.save_pretrained(save_dir, safe_serialization=True)
         self.nooverlap_tokenizer.save(save_dir)
-
         copied_assets = self._copy_optional_tokenizer_assets(save_dir)
 
         with open(os.path.join(save_dir, "training_args.json"), "w", encoding="utf-8") as f:
@@ -716,9 +718,15 @@ class TokenCounterCallback(TrainerCallback):
         latest_log = state.log_history[-1] if state.log_history else {}
         metadata = {
             "checkpoint_name": checkpoint_name,
-            "checkpoint_tokens": checkpoint_tokens,
-            "checkpoint_millions": checkpoint_tokens / 1_000_000,
-            "actual_tokens_seen_estimate": self.total_tokens_seen,
+            # Word-based fields (what BabyLM actually measures)
+            "checkpoint_words": checkpoint_words,
+            "checkpoint_words_millions": checkpoint_words / 1_000_000,
+            "actual_words_seen_estimate": self.total_words_seen,
+            "adjusted_words_per_epoch": self.adjusted_words_per_epoch,
+            # BPE-based fields (for internal reference)
+            "bpe_tokens_per_optimizer_step": self._bpe_tokens_per_optimizer_step(args),
+            "approx_bpe_tokens_seen": state.global_step * self._bpe_tokens_per_optimizer_step(args),
+            # Training state
             "global_step": state.global_step,
             "epoch": safe_float(state.epoch),
             "loss": safe_float(latest_log.get("loss")),
@@ -726,16 +734,17 @@ class TokenCounterCallback(TrainerCallback):
             "max_seq_length": self.max_seq_length,
             "per_device_train_batch_size": args.per_device_train_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "tokens_per_optimizer_step": self._tokens_per_optimizer_step(args),
             "timestamp": datetime.now().isoformat(),
             "tokenizer_assets_copied": copied_assets,
             "checkpoint_type": "babylm_evaluation_checkpoint",
             "tokenization_strategy": "NOOVERLAP",
             "model_architecture": "ModernBERT",
             "objective": "masked_language_modeling",
+            "exposure_unit": "byte_premium_adjusted_whitespace_words",
             "note": (
-                "ModernBERT MLM checkpoint trained on global NOOVERLAP IDs. "
-                "Monolingual local IDs were remapped to disjoint language-specific global segments."
+                "Exposure is counted in byte-premium-adjusted whitespace words "
+                "as required by the BabyLM 2026 multilingual track. "
+                "BPE token counts are logged separately for reference only."
             ),
         }
 
@@ -745,28 +754,30 @@ class TokenCounterCallback(TrainerCallback):
         logger.info("=" * 70)
         logger.info(f"Saved BabyLM-style evaluation checkpoint: {checkpoint_name}")
         logger.info(f"Path: {save_dir}")
-        logger.info(f"Requested exposure threshold: {checkpoint_tokens:,} tokens")
-        logger.info(f"Actual estimated exposure: {self.total_tokens_seen:,} tokens")
+        logger.info(f"Requested word threshold: {checkpoint_words:,} adjusted words")
+        logger.info(f"Actual estimated exposure: {self.total_words_seen:,.0f} adjusted words")
+        logger.info(f"  (~{state.global_step * self._bpe_tokens_per_optimizer_step(args):,} BPE tokens for reference)")
         logger.info(f"Global step: {state.global_step}")
-        logger.info(f"Tokenizer assets copied: {copied_assets}")
         logger.info("=" * 70)
 
     def on_train_begin(self, args, state, control, **kwargs):
-        tokens_per_step = self._tokens_per_optimizer_step(args)
-        self.total_tokens_seen = state.global_step * tokens_per_step
+        words_per_step = self._adjusted_words_per_optimizer_step(args)
+        self.total_words_seen = state.global_step * words_per_step
 
         self.checkpoints_saved = {
-            checkpoint_tokens
-            for checkpoint_tokens in self.checkpoint_intervals
-            if checkpoint_tokens <= self.total_tokens_seen
+            checkpoint_words
+            for checkpoint_words in self.checkpoint_intervals
+            if checkpoint_words <= self.total_words_seen
         }
 
         logger.info("=" * 70)
-        logger.info("BABYLM-STYLE EXPOSURE CHECKPOINT CALLBACK INITIALIZED")
+        logger.info("BABYLM-STYLE WORD-EXPOSURE CHECKPOINT CALLBACK INITIALIZED")
         logger.info(f"Checkpoint output dir: {self.output_dir}")
         logger.info(f"Global step: {state.global_step}")
-        logger.info(f"Tokens per optimizer step: {tokens_per_step:,}")
-        logger.info(f"Initial estimated tokens seen: {self.total_tokens_seen:,}")
+        logger.info(f"Adjusted words per epoch: {self.adjusted_words_per_epoch:,}")
+        logger.info(f"Train dataset size (sequences): {self.train_dataset_size:,}")
+        logger.info(f"Adjusted words per optimizer step: {words_per_step:,.1f}")
+        logger.info(f"Initial estimated words seen: {self.total_words_seen:,.0f}")
         logger.info(f"Already passed checkpoint thresholds: {len(self.checkpoints_saved)}")
         logger.info("=" * 70)
 
@@ -776,20 +787,20 @@ class TokenCounterCallback(TrainerCallback):
             logger.warning("No model found in callback kwargs; cannot save checkpoint.")
             return control
 
-        tokens_per_step = self._tokens_per_optimizer_step(args)
-        self.total_tokens_seen = state.global_step * tokens_per_step
+        words_per_step = self._adjusted_words_per_optimizer_step(args)
+        self.total_words_seen = state.global_step * words_per_step
 
-        for checkpoint_tokens in self.checkpoint_intervals:
+        for checkpoint_words in self.checkpoint_intervals:
             if (
-                self.total_tokens_seen >= checkpoint_tokens
-                and checkpoint_tokens not in self.checkpoints_saved
+                self.total_words_seen >= checkpoint_words
+                and checkpoint_words not in self.checkpoints_saved
             ):
-                self.checkpoints_saved.add(checkpoint_tokens)
+                self.checkpoints_saved.add(checkpoint_words)
                 self._save_babylm_checkpoint(
                     model=model,
                     args=args,
                     state=state,
-                    checkpoint_tokens=checkpoint_tokens,
+                    checkpoint_words=checkpoint_words,
                 )
 
         return control
@@ -904,6 +915,7 @@ def setup_training(
     tokenizer_asset_dir: str,
     max_seq_length: int,
     mlm_probability: float,
+    adjusted_words_per_epoch: int,        # <-- add this
 ) -> tuple:
     logger.info("Setting up ModernBERT MLM training")
 
@@ -949,24 +961,28 @@ def setup_training(
     )
 
     token_callback = TokenCounterCallback(
-        nooverlap_tokenizer=nooverlap_tokenizer,
-        max_seq_length=max_seq_length,
-        checkpoint_intervals=TRAINING_CONFIG["checkpoint_intervals"],
-        output_dir=TRAINING_CONFIG["babylm_checkpoint_dir"],
-        tokenizer_asset_dir=tokenizer_asset_dir,
+    nooverlap_tokenizer=nooverlap_tokenizer,
+    adjusted_words_per_epoch=adjusted_words_per_epoch,
+    train_dataset_size=len(train_dataset),
+    max_seq_length=max_seq_length,
+    checkpoint_intervals=TRAINING_CONFIG["checkpoint_intervals"],
+    output_dir=TRAINING_CONFIG["babylm_checkpoint_dir"],
+    tokenizer_asset_dir=tokenizer_asset_dir,
     )
-
+    
     detailed_callback = DetailedCheckpointCallback(
         checkpoint_dir=TRAINING_CONFIG["detailed_checkpoint_dir"],
         save_every_n_steps=1000,
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        data_collator=collator,
-        callbacks=[token_callback, detailed_callback],
+    trainer, token_callback = setup_training(
+    model=model,
+    train_dataset=train_dataset,
+    nooverlap_tokenizer=nooverlap_tokenizer,
+    tokenizer_asset_dir=args.tokenizer_dir,
+    max_seq_length=args.max_seq_length,
+    mlm_probability=args.mlm_probability,
+    adjusted_words_per_epoch=adjusted_words_per_epoch,   # <-- add this
     )
 
     tokens_per_step = (
@@ -1155,19 +1171,20 @@ def main() -> None:
     nooverlap_tokenizer.save(root_tokenizer_dir)
 
     logger.info("[2/5] Loading same selected datasets as GPT-2 scripts")
-    datasets = load_training_datasets(
-        adjusted_budget_per_lang=args.adjusted_budget_per_lang,
-        max_examples_per_lang=args.max_examples_per_lang,
+    datasets, budget_report = load_training_datasets(
+    adjusted_budget_per_lang=args.adjusted_budget_per_lang,
+    max_examples_per_lang=args.max_examples_per_lang,
     )
 
     logger.info("[3/5] Tokenizing/remapping/chunking datasets for MLM")
-    train_dataset = preprocess_nooverlap_datasets_for_mlm(
-        datasets=datasets,
-        nooverlap_tokenizer=nooverlap_tokenizer,
-        max_seq_length=args.max_seq_length,
-        tokenize_batch_size=TRAINING_CONFIG["data"]["tokenize_batch_size"],
-        chunk_batch_size=TRAINING_CONFIG["data"]["chunk_batch_size"],
-        seed=seed,
+    train_dataset, adjusted_words_per_epoch = preprocess_nooverlap_datasets_for_mlm(
+    datasets=datasets,
+    budget_report=budget_report,
+    nooverlap_tokenizer=nooverlap_tokenizer,
+    max_seq_length=args.max_seq_length,
+    tokenize_batch_size=TRAINING_CONFIG["data"]["tokenize_batch_size"],
+    chunk_batch_size=TRAINING_CONFIG["data"]["chunk_batch_size"],
+    seed=seed,
     )
 
     logger.info("[4/5] Creating ModernBERT MLM model")
@@ -1210,7 +1227,7 @@ def main() -> None:
         f"Exposure checkpoints saved: "
         f"{len(token_callback.checkpoints_saved)}/{len(TRAINING_CONFIG['checkpoint_intervals'])}"
     )
-    logger.info(f"Total estimated training-token exposure: {token_callback.total_tokens_seen:,}")
+    logger.info(f"Total estimated word exposure: {token_callback.total_words_seen:,.0f} adjusted words")
 
     final_dir = os.path.join(TRAINING_CONFIG["output_dir"], "final")
     save_final_bundle(
